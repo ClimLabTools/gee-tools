@@ -43,6 +43,7 @@ def download_modis_et(
         return img.select("ET").rename(date_str)
 
     for year in range(start_year, end_year + 1):
+        print(f"Processing MODIS ET for year {year}...")
         year_collection = (
             modis.filterDate(f"{year}-01-01", f"{year}-12-31")
                  .map(rename_et)

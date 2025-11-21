@@ -41,24 +41,6 @@ def download_image(
 ) -> str:
     """
     Download a single ee.Image using getDownloadURL as a .zip file.
-
-    Parameters
-    ----------
-    image : ee.Image
-        Image to download.
-    region : dict
-        GeoJSON-like region dict (e.g. geometry.getInfo()).
-    scale : int
-        Pixel size in map units.
-    crs : str
-        Coordinate reference system, e.g. "EPSG:4326".
-    filename : str
-        Base filename (without extension).
-
-    Returns
-    -------
-    str
-        Path to the downloaded .zip file.
     """
     params = {
         "name": filename,
@@ -70,6 +52,8 @@ def download_image(
     url = image.getDownloadURL(params)
     out_zip = f"{filename}.zip"
 
+    print(f"Downloading {filename} from {url} ...")
+
     resp = requests.get(url, stream=True)
     resp.raise_for_status()
 
@@ -77,6 +61,7 @@ def download_image(
         for chunk in resp.iter_content(8192):
             f.write(chunk)
 
+    print(f"Saved {out_zip}")
     return out_zip
 
 
