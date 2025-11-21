@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gee-tools"
+version = "0.1.0"
+description = "Reusable Google Earth Engine tools for environmental modelling"
+authors = [
+  { name = "Phillip Schuster" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "earthengine-api",
+  "geemap",
+  "geopandas",
+  "rasterio",
+  "xarray",
+  "rioxarray",
+  "dask",
+  "netCDF4",
+  "pyproj",
+  "requests",
+  "xee",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "black",
+  "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

@@ -1,0 +1,24 @@
+Metadata-Version: 2.4
+Name: gee-tools
+Version: 0.1.0
+Summary: Reusable Google Earth Engine tools for environmental modelling
+Author: Phillip Schuster
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: earthengine-api
+Requires-Dist: geemap
+Requires-Dist: geopandas
+Requires-Dist: rasterio
+Requires-Dist: xarray
+Requires-Dist: rioxarray
+Requires-Dist: dask
+Requires-Dist: netCDF4
+Requires-Dist: pyproj
+Requires-Dist: requests
+Requires-Dist: xee
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: black; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+Dynamic: license-file

@@ -1,0 +1,16 @@
+earthengine-api
+geemap
+geopandas
+rasterio
+xarray
+rioxarray
+dask
+netCDF4
+pyproj
+requests
+xee
+
+[dev]
+pytest
+black
+ruff
