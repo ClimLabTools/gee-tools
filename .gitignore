@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+*.zip
+*.nc
+*.tif
+*.zarr
+.DS_Store
