@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+earthengine-api
+google-auth
+xarray
+rioxarray
+netcdf4
+pandas
+pydantic
+xee

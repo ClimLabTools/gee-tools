@@ -1,0 +1,6 @@
+.git
+__pycache__
+*.pyc
+.env
+auth_key.json
+*.ipynb
