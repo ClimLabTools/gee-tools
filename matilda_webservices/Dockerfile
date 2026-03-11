@@ -1,5 +1,5 @@
 # 1. Basis-Image mit Python 3.10
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 # 2. System-Abhängigkeiten für Geodaten (GDAL/PROJ) installieren
 # Das ist wichtig, damit rioxarray und rasterio funktionieren
