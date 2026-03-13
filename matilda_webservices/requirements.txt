@@ -19,3 +19,4 @@ xee
 geopandas
 geemap
 requests
+tenacity

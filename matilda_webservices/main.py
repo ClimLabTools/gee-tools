@@ -5,6 +5,7 @@ import base64
 from zipfile import ZipFile
 from typing import Literal
 
+import asyncio
 import ee
 import google.auth
 import xarray as xr
@@ -18,6 +19,7 @@ from pydantic import BaseModel
 import hashlib
 import json
 import requests
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ── Config aus Environment Variables ────────────────────────────────────────
 PROJECT_ID = os.environ.get('GEE_PROJECT_ID', 'matilda-489310')
@@ -58,6 +60,10 @@ class GeopotentialRequest(BaseModel):
     catchment: dict  # GeoJSON
 
 class ClimateRequest(BaseModel):
+    catchment: dict  # GeoJSON
+    date_range: list  # ['YYYY-MM-DD', 'YYYY-MM-DD']
+
+class CMIPRequest(BaseModel):
     catchment: dict  # GeoJSON
     date_range: list  # ['YYYY-MM-DD', 'YYYY-MM-DD']
 
@@ -258,6 +264,87 @@ async def get_climate_data(req: ClimateRequest):
             "temp": temp,
             "prec": prec
         }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+@app.post("/cmip6-download")
+async def cmip6_download(req: CMIPRequest):
+    try:
+        catchment_gdf = gpd.GeoDataFrame.from_features(req.catchment['features'])
+        catchment_gdf = catchment_gdf.set_crs('EPSG:4326')
+        catchment_ee = geemap.geopandas_to_ee(catchment_gdf)
+
+        starty = int(req.date_range[0][:4])
+        endy = int(req.date_range[1][:4])
+
+        @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=1, max=60))
+        def download_year(var, year):
+            start = f"{year}-01-01"
+            end = f"{year + 1}-01-01"
+            start_date = ee.Date(start)
+            end_date = ee.Date(end)
+            n = end_date.difference(start_date, 'day').subtract(1)
+
+            collection = ee.ImageCollection('NASA/GDDP-CMIP6') \
+                .select(var) \
+                .filterDate(start_date, end_date) \
+                .filterBounds(catchment_ee) \
+                .filter(ee.Filter.neq('model', 'NorESM2-LM'))
+
+            def rename_band(b):
+                split = ee.String(b).split('_')
+                return ee.String(split.splice(split.length().subtract(2), 1).join("_"))
+
+            def build_feature(i):
+                t1 = start_date.advance(i, 'day')
+                t2 = t1.advance(1, 'day')
+                daily_coll = collection.filterDate(t1, t2)
+                daily_img = daily_coll.toBands()
+                bands = daily_img.bandNames()
+                renamed = bands.map(rename_band)
+                d = daily_img.rename(renamed).reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=catchment_ee,
+                ).combine(
+                    ee.Dictionary({'system:time_start': t1.millis(), 'isodate': t1.format('YYYY-MM-dd')})
+                )
+                return ee.Feature(None, d)
+
+            year_feature = ee.FeatureCollection(ee.List.sequence(0, n).map(build_feature))
+            url = year_feature.getDownloadURL()
+
+            r = requests.get(url, stream=True)
+            r.raise_for_status()
+            return r.text
+
+        async def generate():
+            for var in ['tas', 'pr']:
+                for year in range(starty, endy + 1):
+                    try:
+                        csv_text = await asyncio.get_event_loop().run_in_executor(
+                            None, download_year, var, year
+                        )
+                        chunk = json_lib.dumps({
+                            "year": year,
+                            "var": var,
+                            "csv": csv_text
+                        }) + "\n"
+                        yield chunk.encode('utf-8')
+
+                    except Exception as e:
+                        error_chunk = json_lib.dumps({
+                            "year": year,
+                            "var": var,
+                            "error": str(e)
+                        }) + "\n"
+                        yield error_chunk.encode('utf-8')
+
+        return StreamingResponse(generate(), media_type="application/x-ndjson")
 
     except HTTPException:
         raise
