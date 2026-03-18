@@ -20,6 +20,7 @@ import hashlib
 import json
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
+from pydantic import Field
 
 # ── Config aus Environment Variables ────────────────────────────────────────
 PROJECT_ID = os.environ.get('GEE_PROJECT_ID', 'matilda-489310')
@@ -43,7 +44,7 @@ init_ee()
 
 
 # ── Models ───────────────────────────────────────────────────────────────────
-
+#Validations of requests
 class GeometryPayload(BaseModel):
     type: Literal["Point", "Polygon"]
     coordinates: list
@@ -62,46 +63,48 @@ class GeopotentialRequest(BaseModel):
 class ClimateRequest(BaseModel):
     catchment: dict  # GeoJSON
     date_range: list  # ['YYYY-MM-DD', 'YYYY-MM-DD']
+    max_concurrent: int = Field(default=5, ge=1, le=100)
 
 class CMIPRequest(BaseModel):
     catchment: dict  # GeoJSON
     date_range: list  # ['YYYY-MM-DD', 'YYYY-MM-DD']
+    max_concurrent: int = Field(default=5, ge=1, le=100)
 
 class ResourceSpace:
-    def __init__(self, api_base_url, user, private_key):
+    def __init__(self, api_base_url, user, private_key): #Initializing (saving URL,name and kex)
         self.api_base_url = api_base_url
         self.user = user
         self.private_key = private_key
 
     def do_request(self, query):
-        query = 'user=' + self.user + '&' + query
+        query = 'user=' + self.user + '&' + query #authentication
         sign = hashlib.sha256((self.private_key + query).encode()).hexdigest()
         url = self.api_base_url + query + '&sign=' + sign
         return requests.get(url)
 
-    def do_search(self, search_term):
+    def do_search(self, search_term): #requesting a search and is sending a JSON back
         query = 'function=do_search&search=' + requests.utils.quote(str(search_term))
         response = self.do_request(query)
         if response.status_code == 200:
             return json.loads(response.text)
         return None
 
-    def get_resource_data(self, ref):
+    def get_resource_data(self, ref): #get Metadata
         query = 'function=get_resource_data&resource=' + str(ref)
         response = self.do_request(query)
         if response.status_code == 200:
             return json.loads(response.text)
         return None
 
-    def get_resource_file(self, ref, ext=""):
+    def get_resource_file(self, ref, ext=""): #wrapper function
         if ext == "":
-            resource_data = self.get_resource_data(ref)
+            resource_data = self.get_resource_data(ref) #gets metadata; only needed if not ending given 
             ext = resource_data["file_extension"]
         query = 'function=get_resource_path&ref=' + str(ref) + '&extension=' + str(ext)
-        response = self.do_request(query)
+        response = self.do_request(query) #gets downnload url
         if response.status_code == 200:
             download_url = response.text.replace('\\/', '/').strip('"')
-            response = requests.get(download_url)
+            response = requests.get(download_url) #loads the requested data
             if response.status_code == 200:
                 return response.content
         return None
@@ -112,7 +115,7 @@ class ResourceSpace:
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
-def health_check():
+def health_check(): #check whether API is running
     return {"status": "online", "project": PROJECT_ID}
 
 
@@ -124,19 +127,20 @@ async def download_dem(req: DEMRequest, background_tasks: BackgroundTasks):
             coordinates = req.geometry.coordinates
             if geometry_type == "Point":
                 if not isinstance(coordinates, list) or len(coordinates) != 2:
-                    raise HTTPException(status_code=422, detail="Point geometry braucht [lon, lat] in coordinates.")
+                    raise HTTPException(status_code=422, detail="Point geometry needs [lon, lat] in coordinates.")
                 point = ee.Geometry.Point(coordinates)
-                region = point.buffer(req.buffer_m).bounds()
+                region = point.buffer(req.buffer_m).bounds() #circle: Bounding Box
             elif geometry_type == "Polygon":
-                region = ee.Geometry.Polygon(coordinates)
+                region = ee.Geometry.Polygon(coordinates) #taking Polygon
             else:
                 raise HTTPException(status_code=422, detail="geometry.type muss 'Point' oder 'Polygon' sein.")
         else:
             if req.lat is None or req.lon is None:
-                raise HTTPException(status_code=422, detail="Bitte entweder geometry oder lat/lon angeben.")
+                raise HTTPException(status_code=422, detail="Please give a geometry or lat/lon.")
             point = ee.Geometry.Point([req.lon, req.lat])
-            region = point.buffer(req.buffer_m).bounds()
+            region = point.buffer(req.buffer_m).bounds() 
 
+        # loading data from GEE
         image = ee.Image(req.asset).select(req.band)
         ic = ee.ImageCollection([image])
         ds = xr.open_dataset(ic, engine='ee', projection=image.projection(), geometry=region)
@@ -148,25 +152,31 @@ async def download_dem(req: DEMRequest, background_tasks: BackgroundTasks):
         buffer = io.BytesIO()
         ds_t.rio.to_raster(buffer, driver="GTiff")
         buffer.seek(0)
-        background_tasks.add_task(buffer.close)
+        background_tasks.add_task(buffer.close) # close ofter streaming; finally command
 
         return StreamingResponse(
             buffer,
             media_type="image/tiff",
             headers={"Content-Disposition": "attachment; filename=dem_export.tif"}
         )
-
-    except HTTPException:
+    # ensures that log Stacktrace is send to Server and printed as an error message
+    except HTTPException: 
         raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+##### STREAMING ######
+    '''
+    Data is read and send partly: chunks possible
+    '''
 
 
 @app.post("/geopotential")
 async def get_geopotential(req: GeopotentialRequest):
     try:
-        # 1. ZIP vom Media-Server holen
+        # Get ZIP from Media server
         myrepository = ResourceSpace(MEDIA_API_URL, MEDIA_USER, MEDIA_PRIVATE_KEY)
         
         refs_raw = myrepository.get_collection_resources(ERA5L_COLLECTION_ID)
@@ -180,21 +190,21 @@ async def get_geopotential(req: GeopotentialRequest):
 
         content = myrepository.get_resource_file(ref_geopot.at[ref_geopot.index[0], 'ref'])
 
-        # 2. Entpacken → NetCDF einlesen
+        # read NetCDF
         with ZipFile(io.BytesIO(content), 'r') as zipObj:
             filename = zipObj.namelist()[0]
             file_bytes = zipObj.read(filename)
 
         ds = xr.open_dataset(io.BytesIO(file_bytes), engine='h5netcdf')
 
-        # 3. Catchment BBox + croppen
+        # Catchment BBox + croppen
         catchment_gdf = gpd.GeoDataFrame.from_features(req.catchment['features'])
         catchment_gdf = catchment_gdf.set_crs('EPSG:4326')
         bounds = catchment_gdf.total_bounds
         min_lon, min_lat, max_lon, max_lat = bounds[0]-1, bounds[1]-1, bounds[2]+1, bounds[3]+1
         cropped_ds = ds.sel(lat=slice(min_lat, max_lat), lon=slice(min_lon, max_lon))
 
-        # 4. GEE-Konvertierung + Reducer
+        #  GEE-Konvertierung + Reducer
         catchment_ee = geemap.geopandas_to_ee(catchment_gdf)
         data = cropped_ds['z']
         lon_data = np.round(data['lon'], 3)
@@ -217,7 +227,7 @@ async def get_geopotential(req: GeopotentialRequest):
         mean_val = result.getInfo()['z']
         ele_dat = mean_val / 9.80665
 
-        # 5. Gecroptes NetCDF base64-encodieren
+        # encode NetCDF base64
         netcdf_buffer = io.BytesIO()
         cropped_ds.to_netcdf(netcdf_buffer, engine='h5netcdf')
         netcdf_buffer.seek(0)
@@ -235,119 +245,220 @@ async def get_geopotential(req: GeopotentialRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     
+
+#TO DO parralleisieren? Zu langsam
+    
+# @app.post("/climate-data")
+# async def get_climate_data(req: ClimateRequest):
+#     try:
+#         # convert Catchment zto GEE
+#         catchment_gdf = gpd.GeoDataFrame.from_features(req.catchment['features'])
+#         catchment_gdf = catchment_gdf.set_crs('EPSG:4326')
+#         catchment_ee = geemap.geopandas_to_ee(catchment_gdf)
+
+#         # filter ERA5-Land Collection + reduceRegion
+#         def set_property(image):
+#             d = image.reduceRegion(ee.Reducer.mean(), catchment_ee)
+#             return image.set(d)
+
+#         collection = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_RAW') \
+#             .select('temperature_2m', 'total_precipitation_sum') \
+#             .filterDate(req.date_range[0], req.date_range[1])
+
+#         with_mean = collection.map(set_property)
+
+#         # send back raw errors
+#         timestamps = with_mean.aggregate_array('system:time_start').getInfo()
+#         temp = with_mean.aggregate_array('temperature_2m').getInfo()
+#         prec = with_mean.aggregate_array('total_precipitation_sum').getInfo()
+
+#         return {
+#             "timestamps": timestamps,
+#             "temp": temp,
+#             "prec": prec
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         traceback.print_exc()
+#         raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/climate-data")
 async def get_climate_data(req: ClimateRequest):
     try:
-        # 1. Catchment zu GEE konvertieren
         catchment_gdf = gpd.GeoDataFrame.from_features(req.catchment['features'])
         catchment_gdf = catchment_gdf.set_crs('EPSG:4326')
         catchment_ee = geemap.geopandas_to_ee(catchment_gdf)
+        starty = int(req.date_range[0][:4])
+        endy   = int(req.date_range[1][:4])
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
-        # 2. ERA5-Land Collection filtern + reduceRegion
+    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=1, max=60))
+    def fetch_year(year):
+        start = f"{year}-01-01"
+        end   = f"{year + 1}-01-01"
+
         def set_property(image):
             d = image.reduceRegion(ee.Reducer.mean(), catchment_ee)
             return image.set(d)
 
         collection = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_RAW') \
             .select('temperature_2m', 'total_precipitation_sum') \
-            .filterDate(req.date_range[0], req.date_range[1])
+            .filterDate(start, end)
 
         with_mean = collection.map(set_property)
 
-        # 3. Rohe Arrays zurückschicken
-        timestamps = with_mean.aggregate_array('system:time_start').getInfo()
-        temp = with_mean.aggregate_array('temperature_2m').getInfo()
-        prec = with_mean.aggregate_array('total_precipitation_sum').getInfo()
+        result = with_mean.reduceColumns(
+            ee.Reducer.toList(3),
+            ['system:time_start', 'temperature_2m', 'total_precipitation_sum']
+        ).getInfo()
 
+        values = result['list']
         return {
-            "timestamps": timestamps,
-            "temp": temp,
-            "prec": prec
+            "timestamps": [row[0] for row in values],
+            "temp":       [row[1] for row in values],
+            "prec":       [row[2] for row in values]
         }
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    async def generate():
+
+        semaphore = asyncio.Semaphore(req.max_concurrent)
+
+        async def fetch_one(year):
+            async with semaphore:
+                loop = asyncio.get_event_loop()
+                try:
+                    data = await loop.run_in_executor(None, fetch_year, year)
+                    return json.dumps({"year": year, **data}) + "\n"
+                except Exception as e:
+                    print(f"Error{year}: {e}")
+                    return json.dumps({"year": year, "error": str(e)}) + "\n"
+
+        years = list(range(starty, endy + 1))
+        print(f"{len(years)} years created")
+
+        queue = asyncio.Queue()
+
+        async def worker(year):
+            result = await fetch_one(year)
+            await queue.put(result)
+
+        tasks = [asyncio.create_task(worker(year)) for year in years]
+
+        for _ in years:
+            chunk = await queue.get()
+            yield chunk.encode('utf-8')
+
+        await asyncio.gather(*tasks)
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
     
+# 30 threads gleichzeitig/ multi processing 
 
 @app.post("/cmip6-download")
 async def cmip6_download(req: CMIPRequest):
     try:
         catchment_gdf = gpd.GeoDataFrame.from_features(req.catchment['features'])
         catchment_gdf = catchment_gdf.set_crs('EPSG:4326')
-        catchment_ee = geemap.geopandas_to_ee(catchment_gdf)
+        catchment_ee = geemap.geopandas_to_ee(catchment_gdf) #convert in GEE object
 
         starty = int(req.date_range[0][:4])
         endy = int(req.date_range[1][:4])
-
-        @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=1, max=60))
-        def download_year(var, year):
-            start = f"{year}-01-01"
-            end = f"{year + 1}-01-01"
-            start_date = ee.Date(start)
-            end_date = ee.Date(end)
-            n = end_date.difference(start_date, 'day').subtract(1)
-
-            collection = ee.ImageCollection('NASA/GDDP-CMIP6') \
-                .select(var) \
-                .filterDate(start_date, end_date) \
-                .filterBounds(catchment_ee) \
-                .filter(ee.Filter.neq('model', 'NorESM2-LM'))
-
-            def rename_band(b):
-                split = ee.String(b).split('_')
-                return ee.String(split.splice(split.length().subtract(2), 1).join("_"))
-
-            def build_feature(i):
-                t1 = start_date.advance(i, 'day')
-                t2 = t1.advance(1, 'day')
-                daily_coll = collection.filterDate(t1, t2)
-                daily_img = daily_coll.toBands()
-                bands = daily_img.bandNames()
-                renamed = bands.map(rename_band)
-                d = daily_img.rename(renamed).reduceRegion(
-                    reducer=ee.Reducer.mean(),
-                    geometry=catchment_ee,
-                ).combine(
-                    ee.Dictionary({'system:time_start': t1.millis(), 'isodate': t1.format('YYYY-MM-dd')})
-                )
-                return ee.Feature(None, d)
-
-            year_feature = ee.FeatureCollection(ee.List.sequence(0, n).map(build_feature))
-            url = year_feature.getDownloadURL()
-
-            r = requests.get(url, stream=True)
-            r.raise_for_status()
-            return r.text
-
-        async def generate():
-            for var in ['tas', 'pr']:
-                for year in range(starty, endy + 1):
-                    try:
-                        csv_text = await asyncio.get_event_loop().run_in_executor(
-                            None, download_year, var, year
-                        )
-                        chunk = json_lib.dumps({
-                            "year": year,
-                            "var": var,
-                            "csv": csv_text
-                        }) + "\n"
-                        yield chunk.encode('utf-8')
-
-                    except Exception as e:
-                        error_chunk = json_lib.dumps({
-                            "year": year,
-                            "var": var,
-                            "error": str(e)
-                        }) + "\n"
-                        yield error_chunk.encode('utf-8')
-
-        return StreamingResponse(generate(), media_type="application/x-ndjson")
-
-    except HTTPException:
-        raise
+    
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=1, max=60)) #retry up to 10 time when API connection is instable
+    def download_year(var, year): #filter data
+        start = f"{year}-01-01"
+        end = f"{year + 1}-01-01"
+        start_date = ee.Date(start)
+        end_date = ee.Date(end)
+        n = end_date.difference(start_date, 'day').subtract(1)
+
+        collection = ee.ImageCollection('NASA/GDDP-CMIP6') \
+            .select(var) \
+            .filterDate(start_date, end_date) \
+            .filterBounds(catchment_ee) \
+            .filter(ee.Filter.neq('model', 'NorESM2-LM'))
+
+        def rename_band(b):
+            split = ee.String(b).split('_')
+            return ee.String(split.splice(split.length().subtract(2), 1).join("_"))
+
+            #calculate the spatial mean
+        def build_feature(i):
+            t1 = start_date.advance(i, 'day')
+            t2 = t1.advance(1, 'day')
+            daily_coll = collection.filterDate(t1, t2)
+            daily_img = daily_coll.toBands()
+            bands = daily_img.bandNames()
+            renamed = bands.map(rename_band)
+            d = daily_img.rename(renamed).reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=catchment_ee,
+            ).combine(
+                ee.Dictionary({'system:time_start': t1.millis(), 'isodate': t1.format('YYYY-MM-dd')})
+            )
+            return ee.Feature(None, d)
+
+        year_feature = ee.FeatureCollection(ee.List.sequence(0, n).map(build_feature))
+        features = year_feature.getInfo()
+        rows = [feat['properties'] for feat in features['features']]
+        df = pd.DataFrame(rows)
+
+        if 'system:index' not in df.columns:
+            df['system:index'] = range(len(df))
+        if '.geo' not in df.columns:
+            df['.geo'] = None
+
+        return df.to_csv(index=False)
+
+    #async: running `run_in_executor`** – `download_year` in a separate thread to not block Server
+    # Streaming data with Chunks: Sending yearly data directly and not all at once
+        
+
+
+    async def generate():
+        print("🟢 generate() gestartet")
+
+        semaphore = asyncio.Semaphore(req.max_concurrent)
+
+        async def download_one(var, year):
+            async with semaphore:
+                loop = asyncio.get_event_loop()
+                try:
+                    csv_text = await loop.run_in_executor(None, download_year, var, year)
+                    return json.dumps({"year": year, "var": var, "csv": csv_text}) + "\n"
+                except Exception as e:
+                    # Echten Fehler aus RetryError extrahieren
+                    cause = e.last_attempt.exception() if hasattr(e, 'last_attempt') else e
+                    print(f"🔴 {var} {year}: {cause}")
+                    return json.dumps({"year": year, "var": var, "error": str(cause)}) + "\n"
+
+        combinations = [
+            (var, year)
+            for var in ['tas', 'pr']
+            for year in range(starty, endy + 1)
+        ]
+        print(f"🟢 {len(combinations)} Tasks erstellt")
+
+        queue = asyncio.Queue()
+
+        async def worker(var, year):
+            result = await download_one(var, year)
+            await queue.put(result)
+
+        tasks = [asyncio.create_task(worker(var, year)) for var, year in combinations]
+
+        for _ in combinations:
+            chunk = await queue.get()
+            yield chunk.encode('utf-8')
+
+        await asyncio.gather(*tasks)
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
